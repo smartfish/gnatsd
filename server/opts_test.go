@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"io/ioutil"
 	"net/url"
 	"os"
@@ -738,6 +739,13 @@ func TestOptionsClone(t *testing.T) {
 			NoAdvertise:    true,
 			ConnectRetries: 2,
 		},
+		Gateway: GatewayOpts{
+			Name: "A",
+			Gateways: []*GatewayConnOpts{
+				{Name: "B", URLs: []*url.URL{&url.URL{Scheme: "nats", Host: "host:5222"}}},
+				{Name: "C"},
+			},
+		},
 		WriteDeadline: 3 * time.Second,
 		Routes:        []*url.URL{&url.URL{}},
 		Users:         []*User{&User{Username: "foo", Password: "bar"}},
@@ -753,6 +761,14 @@ func TestOptionsClone(t *testing.T) {
 	clone.Users[0].Password = "baz"
 	if reflect.DeepEqual(opts, clone) {
 		t.Fatal("Expected Options to be different")
+	}
+
+	opts.Gateway.Gateways[0].URLs[0] = nil
+	if reflect.DeepEqual(opts.Gateway.Gateways[0], clone.Gateway.Gateways[0]) {
+		t.Fatal("Expected Options to be different")
+	}
+	if clone.Gateway.Gateways[0].URLs[0].Host != "host:5222" {
+		t.Fatalf("Unexpected URL: %v", clone.Gateway.Gateways[0].URLs[0])
 	}
 }
 
@@ -1015,5 +1031,211 @@ func TestConfigureOptions(t *testing.T) {
 	opts = mustNotFail([]string{"-tls", "-tlscert", "./configs/certs/server.pem", "-tlskey", "./configs/certs/key.pem"})
 	if opts.TLSConfig == nil || !opts.TLS {
 		t.Fatal("Expected TLSConfig to be set")
+	}
+}
+
+func TestParsingGateways(t *testing.T) {
+	content := `
+	gateway {
+		name: "A"
+		listen: "127.0.0.1:4444"
+		host: "127.0.0.1"
+		port: 4444
+		authorization {
+			user: "ivan"
+			password: "pwd"
+			timeout: 2.0
+		}
+		tls {
+			cert_file: "./configs/certs/server.pem"
+			key_file: "./configs/certs/key.pem"
+			timeout: 3.0
+		}
+		advertise: "me:1"
+		connect_retries: 10
+		gateways: [
+			{
+				name: "B"
+				urls: ["nats://user1:pwd1@host2:5222", "nats://user1:pwd1@host3:6222"]
+			}
+			{
+				name: "C"
+				url: "nats://host4:7222"
+			}
+		]
+	}
+	`
+	file := "server_config_gateways.conf"
+	defer os.Remove(file)
+	if err := ioutil.WriteFile(file, []byte(content), 0600); err != nil {
+		t.Fatalf("Error writing config file: %v", err)
+	}
+	opts, err := ProcessConfigFile(file)
+	if err != nil {
+		t.Fatalf("Error processing file: %v", err)
+	}
+
+	expected := &GatewayOpts{
+		Name:           "A",
+		Host:           "127.0.0.1",
+		Port:           4444,
+		Username:       "ivan",
+		Password:       "pwd",
+		AuthTimeout:    2.0,
+		Advertise:      "me:1",
+		ConnectRetries: 10,
+		TLSTimeout:     3.0,
+	}
+	u1, _ := url.Parse("nats://user1:pwd1@host2:5222")
+	u2, _ := url.Parse("nats://user1:pwd1@host3:6222")
+	urls := []*url.URL{u1, u2}
+	gw := &GatewayConnOpts{
+		Name: "B",
+		URLs: urls,
+	}
+	expected.Gateways = append(expected.Gateways, gw)
+
+	u1, _ = url.Parse("nats://host4:7222")
+	urls = []*url.URL{u1}
+	gw = &GatewayConnOpts{
+		Name: "C",
+		URLs: urls,
+	}
+	expected.Gateways = append(expected.Gateways, gw)
+
+	// Just make sure that TLSConfig is set.. we have aother test
+	// to check proper generating TLSConfig from config file...
+	if opts.Gateway.TLSConfig == nil {
+		t.Fatalf("Expected TLSConfig, got none")
+	}
+	opts.Gateway.TLSConfig = nil
+	if !reflect.DeepEqual(&opts.Gateway, expected) {
+		t.Fatalf("Expected %v, got %v", expected, opts.Gateway)
+	}
+}
+
+func TestParsingGatewaysErrors(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		content     string
+		expectedErr string
+	}{
+		{
+			"gateways_bad_listen",
+			`gateway {
+				name: "A"
+				port: -1
+				listen: "bad::address"
+			}`,
+			"parse address",
+		},
+		{
+			"gateways_bad_auth",
+			`gateway {
+				name: "A"
+				port: -1
+				authorization {
+					users {
+					}
+				}
+			}`,
+			"be an array",
+		},
+		{
+			"gateways_users_not_supported",
+			`gateway {
+				name: "A"
+				port: -1
+				authorization {
+					users [
+						{user: alice, password: foo}
+						{user: bob,   password: bar}
+					]
+				}
+			}`,
+			"does not allow multiple users",
+		},
+		{
+			"gateways_tls_error",
+			`gateway {
+				name: "A"
+				port: -1
+				tls {
+					cert_file: 123
+				}
+			}`,
+			"to be filename",
+		},
+		{
+			"gateways_tls_gen_error",
+			`gateway {
+				name: "A"
+				port: -1
+				tls {
+					cert_file: "./configs/certs/server.pem"
+				}
+			}`,
+			"certificate/key pair",
+		},
+		{
+			"gateways_field_needs_to_be_an_array",
+			`gateway {
+				name: "A"
+				gateways {
+					name: "B"
+				}
+			}`,
+			"expected gateways field to be an array",
+		},
+		{
+			"gateway_entry_needs_to_be_a_map",
+			`gateway {
+				name: "A"
+				gateways [
+					"g1", "g2"
+				]
+			}`,
+			"expected gateway entry to be a map",
+		},
+		{
+			"parsing_gateway_url",
+			`gateway {
+				name: "A"
+				gateways [
+					{
+						name: "B"
+						url: "nats://wrong url"
+					}
+				]
+			}`,
+			"error parsing gateway url",
+		},
+		{
+			"parsing_gateway_urls",
+			`gateway {
+				name: "A"
+				gateways [
+					{
+						name: "B"
+						urls: ["nats://wrong url", "nats://host:5222"]
+					}
+				]
+			}`,
+			"error parsing gateway url",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			file := fmt.Sprintf("server_config_gateways_%s.conf", test.name)
+			defer os.Remove(file)
+			if err := ioutil.WriteFile(file, []byte(test.content), 0600); err != nil {
+				t.Fatalf("Error writing config file: %v", err)
+			}
+			_, err := ProcessConfigFile(file)
+			if err == nil {
+				t.Fatalf("Expected to fail, did not. Content:\n%s\n", test.content)
+			} else if !strings.Contains(err.Error(), test.expectedErr) {
+				t.Fatalf("Expected error containing %q, got %q, for content:\n%s\n", test.expectedErr, err, test.content)
+			}
+		})
 	}
 }

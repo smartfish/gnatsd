@@ -46,6 +46,27 @@ type ClusterOpts struct {
 	ConnectRetries int         `json:"-"`
 }
 
+// GatewayConnOpts are options for connecting to a remote gateway
+type GatewayConnOpts struct {
+	Name string     `json:"name"`
+	URLs []*url.URL `json:"urls"`
+}
+
+// GatewayOpts are options for gateways.
+type GatewayOpts struct {
+	Name           string             `json:"name"`
+	Host           string             `json:"addr"`
+	Port           int                `json:"port"`
+	Username       string             `json:"username"`
+	Password       string             `json:"password"`
+	AuthTimeout    float64            `json:"auth_timeout"`
+	TLSTimeout     float64            `json:"tls_timeout"`
+	TLSConfig      *tls.Config        `json:"-"`
+	Advertise      string             `json:"advertise"`
+	ConnectRetries int                `json:"connect_retries"`
+	Gateways       []*GatewayConnOpts `json:"gateways"`
+}
+
 // Options block for gnatsd server.
 type Options struct {
 	ConfigFile      string        `json:"-"`
@@ -71,6 +92,7 @@ type Options struct {
 	MaxControlLine  int           `json:"max_control_line"`
 	MaxPayload      int           `json:"max_payload"`
 	Cluster         ClusterOpts   `json:"cluster"`
+	Gateway         GatewayOpts   `json:"gateway"`
 	ProfPort        int           `json:"-"`
 	PidFile         string        `json:"-"`
 	LogFile         string        `json:"-"`
@@ -89,6 +111,9 @@ type Options struct {
 
 	CustomClientAuthentication Authentication `json:"-"`
 	CustomRouterAuthentication Authentication `json:"-"`
+
+	// private fields, used for testing
+	gatewaysSolicitDelay time.Duration
 }
 
 // Clone performs a deep copy of the Options struct, returning a new clone
@@ -106,12 +131,7 @@ func (o *Options) Clone() *Options {
 		}
 	}
 	if o.Routes != nil {
-		clone.Routes = make([]*url.URL, len(o.Routes))
-		for i, route := range o.Routes {
-			routeCopy := &url.URL{}
-			*routeCopy = *route
-			clone.Routes[i] = routeCopy
-		}
+		clone.Routes = deepCopyURLs(o.Routes)
 	}
 	if o.TLSConfig != nil {
 		clone.TLSConfig = util.CloneTLSConfig(o.TLSConfig)
@@ -119,7 +139,33 @@ func (o *Options) Clone() *Options {
 	if o.Cluster.TLSConfig != nil {
 		clone.Cluster.TLSConfig = util.CloneTLSConfig(o.Cluster.TLSConfig)
 	}
+	if o.Gateway.TLSConfig != nil {
+		clone.Gateway.TLSConfig = util.CloneTLSConfig(o.Gateway.TLSConfig)
+	}
+	if len(o.Gateway.Gateways) > 0 {
+		clone.Gateway.Gateways = make([]*GatewayConnOpts, len(o.Gateway.Gateways))
+		for i, g := range o.Gateway.Gateways {
+			gc := &GatewayConnOpts{
+				Name: g.Name,
+				URLs: deepCopyURLs(g.URLs),
+			}
+			clone.Gateway.Gateways[i] = gc
+		}
+	}
 	return clone
+}
+
+func deepCopyURLs(urls []*url.URL) []*url.URL {
+	if urls == nil {
+		return nil
+	}
+	curls := make([]*url.URL, len(urls))
+	for i, u := range urls {
+		cu := &url.URL{}
+		*cu = *u
+		curls[i] = cu
+	}
+	return curls
 }
 
 // Configuration file authorization section.
@@ -273,6 +319,11 @@ func (o *Options) ProcessConfigFile(configFile string) error {
 			if err := parseCluster(cm, o); err != nil {
 				return err
 			}
+		case "gateway":
+			gm := v.(map[string]interface{})
+			if err := parseGateway(gm, o); err != nil {
+				return err
+			}
 		case "logfile", "log_file":
 			o.LogFile = v.(string)
 		case "syslog":
@@ -377,31 +428,18 @@ func parseCluster(cm map[string]interface{}, opts *Options) error {
 			opts.Cluster.Password = auth.pass
 			opts.Cluster.AuthTimeout = auth.timeout
 		case "routes":
-			ra := mv.([]interface{})
-			opts.Routes = make([]*url.URL, 0, len(ra))
-			for _, r := range ra {
-				routeURL := r.(string)
-				url, err := url.Parse(routeURL)
-				if err != nil {
-					return fmt.Errorf("error parsing route url [%q]", routeURL)
-				}
-				opts.Routes = append(opts.Routes, url)
-			}
-		case "tls":
-			tlsm := mv.(map[string]interface{})
-			tc, err := parseTLS(tlsm)
+			routes, err := parseURLs(mv.([]interface{}), "route")
 			if err != nil {
 				return err
 			}
-			if opts.Cluster.TLSConfig, err = GenTLSConfig(tc); err != nil {
+			opts.Routes = routes
+		case "tls":
+			config, timeout, err := getTLSConfig(mv.(map[string]interface{}))
+			if err != nil {
 				return err
 			}
-			// For clusters, we will force strict verification. We also act
-			// as both client and server, so will mirror the rootCA to the
-			// clientCA pool.
-			opts.Cluster.TLSConfig.ClientAuth = tls.RequireAndVerifyClientCert
-			opts.Cluster.TLSConfig.RootCAs = opts.Cluster.TLSConfig.ClientCAs
-			opts.Cluster.TLSTimeout = tc.Timeout
+			opts.Cluster.TLSConfig = config
+			opts.Cluster.TLSTimeout = timeout
 		case "cluster_advertise", "advertise":
 			opts.Cluster.Advertise = mv.(string)
 		case "no_advertise":
@@ -411,6 +449,133 @@ func parseCluster(cm map[string]interface{}, opts *Options) error {
 		}
 	}
 	return nil
+}
+
+func parseURLs(ua []interface{}, typ string) ([]*url.URL, error) {
+	urls := make([]*url.URL, 0, len(ua))
+	for _, u := range ua {
+		url, err := parseURL(u.(string), typ)
+		if err != nil {
+			return nil, err
+		}
+		urls = append(urls, url)
+	}
+	return urls, nil
+}
+
+func parseURL(u string, typ string) (*url.URL, error) {
+	urlStr := strings.TrimSpace(u)
+	url, err := url.Parse(urlStr)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing %v url [%q]", typ, urlStr)
+	}
+	return url, nil
+}
+
+func parseGateway(gm map[string]interface{}, o *Options) error {
+	for mk, mv := range gm {
+		switch strings.ToLower(mk) {
+		case "name":
+			o.Gateway.Name = mv.(string)
+		case "listen":
+			hp, err := parseListen(mv)
+			if err != nil {
+				return err
+			}
+			o.Gateway.Host = hp.host
+			o.Gateway.Port = hp.port
+		case "port":
+			o.Gateway.Port = int(mv.(int64))
+		case "host", "net":
+			o.Gateway.Host = mv.(string)
+		case "authorization":
+			am := mv.(map[string]interface{})
+			auth, err := parseAuthorization(am)
+			if err != nil {
+				return err
+			}
+			if auth.users != nil {
+				return fmt.Errorf("Gateway authorization does not allow multiple users")
+			}
+			o.Gateway.Username = auth.user
+			o.Gateway.Password = auth.pass
+			o.Gateway.AuthTimeout = auth.timeout
+		case "tls":
+			config, timeout, err := getTLSConfig(mv.(map[string]interface{}))
+			if err != nil {
+				return err
+			}
+			o.Gateway.TLSConfig = config
+			o.Gateway.TLSTimeout = timeout
+		case "advertise":
+			o.Gateway.Advertise = mv.(string)
+		case "connect_retries":
+			o.Gateway.ConnectRetries = int(mv.(int64))
+		case "gateways":
+			gateways, err := parseGateways(mv)
+			if err != nil {
+				return err
+			}
+			o.Gateway.Gateways = gateways
+		}
+	}
+	return nil
+}
+
+// Parse TLS and returns a TLSConfig and TLSTimeout.
+// Used by cluster and gateway parsing.
+func getTLSConfig(tlsm map[string]interface{}) (*tls.Config, float64, error) {
+	tc, err := parseTLS(tlsm)
+	if err != nil {
+		return nil, 0, err
+	}
+	config, err := GenTLSConfig(tc)
+	if err != nil {
+		return nil, 0, err
+	}
+	// For clusters/gateways, we will force strict verification. We also act
+	// as both client and server, so will mirror the rootCA to the
+	// clientCA pool.
+	config.ClientAuth = tls.RequireAndVerifyClientCert
+	config.RootCAs = config.ClientCAs
+	return config, tc.Timeout, nil
+}
+
+func parseGateways(mv interface{}) ([]*GatewayConnOpts, error) {
+	// Make sure we have an array
+	ga, ok := mv.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("expected gateways field to be an array, got %v", mv)
+	}
+	gateways := []*GatewayConnOpts{}
+	for _, u := range ga {
+		// Check its a map/struct
+		gm, ok := u.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("expected gateway entry to be a map/struct, got %v", u)
+		}
+		gateway := &GatewayConnOpts{}
+		for k, v := range gm {
+			switch strings.ToLower(k) {
+			case "name":
+				gateway.Name = v.(string)
+			case "url":
+				url, err := parseURL(v.(string), "gateway")
+				if err != nil {
+					return nil, err
+				}
+				gateway.URLs = append(gateway.URLs, url)
+			case "urls":
+				urls, err := parseURLs(v.([]interface{}), "gateway")
+				if err != nil {
+					return nil, err
+				}
+				gateway.URLs = urls
+			}
+		}
+		gateways = append(gateways, gateway)
+	}
+	return gateways, nil
 }
 
 // Helper function to parse Authorization configs.

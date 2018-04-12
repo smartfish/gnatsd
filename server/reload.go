@@ -502,8 +502,13 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 	)
 
 	for i := 0; i < oldConfig.NumField(); i++ {
+		field := oldConfig.Type().Field(i)
+		// field.PkgPath is empty for exported fields, and is not for unexported ones.
+		// We skip the unexported fields.
+		if field.PkgPath != "" {
+			continue
+		}
 		var (
-			field    = oldConfig.Type().Field(i)
 			oldValue = oldConfig.Field(i).Interface()
 			newValue = newConfig.Field(i).Interface()
 			changed  = !reflect.DeepEqual(oldValue, newValue)

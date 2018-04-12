@@ -17,8 +17,10 @@ import (
 	"flag"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -589,5 +591,122 @@ func TestProfilingNoTimeout(t *testing.T) {
 	}
 	if srv.WriteTimeout != 0 {
 		t.Fatalf("WriteTimeout should not be set, was set to %v", srv.WriteTimeout)
+	}
+}
+
+func TestServerValidateGatewaysOptions(t *testing.T) {
+	baseOpt := testDefaultOptionsForGateway("A")
+	u, _ := url.Parse("host:5222")
+	g := &GatewayConnOpts{
+		URLs: []*url.URL{u},
+	}
+	baseOpt.Gateway.Gateways = append(baseOpt.Gateway.Gateways, g)
+
+	for _, test := range []struct {
+		name        string
+		opts        func() *Options
+		expectedErr string
+	}{
+		{
+			name: "gateway_has_no_name",
+			opts: func() *Options {
+				o := baseOpt.Clone()
+				o.Gateway.Name = ""
+				return o
+			},
+			expectedErr: "has no name",
+		},
+		{
+			name: "gateway_has_no_name",
+			opts: func() *Options {
+				o := baseOpt.Clone()
+				o.Gateway.Port = 0
+				return o
+			},
+			expectedErr: "no port specified",
+		},
+		{
+			name: "gateway_dst_has_no_name",
+			opts: func() *Options {
+				o := baseOpt.Clone()
+				return o
+			},
+			expectedErr: "has no name",
+		},
+		{
+			name: "gateway_dst_urls_is_nil",
+			opts: func() *Options {
+				o := baseOpt.Clone()
+				o.Gateway.Gateways[0].Name = "B"
+				o.Gateway.Gateways[0].URLs = nil
+				return o
+			},
+			expectedErr: "has no URL",
+		},
+		{
+			name: "gateway_dst_urls_is_empty",
+			opts: func() *Options {
+				o := baseOpt.Clone()
+				o.Gateway.Gateways[0].Name = "B"
+				o.Gateway.Gateways[0].URLs = []*url.URL{}
+				return o
+			},
+			expectedErr: "has no URL",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			defer func() {
+				r := recover()
+				if r == nil {
+					t.Fatalf("Expected to fail, it did not")
+				}
+				err := r.(error)
+				if !strings.Contains(err.Error(), test.expectedErr) {
+					t.Fatalf("Expected error about %q, got %v", test.expectedErr, err)
+				}
+			}()
+			New(test.opts())
+		})
+	}
+}
+
+func TestAcceptError(t *testing.T) {
+	o := DefaultOptions()
+	s := New(o)
+	s.mu.Lock()
+	s.running = true
+	s.mu.Unlock()
+	defer s.Shutdown()
+	orgDelay := time.Hour
+	delay := s.acceptError("Test", fmt.Errorf("any error"), orgDelay)
+	if delay != orgDelay {
+		t.Fatalf("With this type of error, delay should have stayed same, got %v", delay)
+	}
+
+	// Create any net.Error and make it a temporary
+	ne := &net.DNSError{IsTemporary: true}
+	orgDelay = 10 * time.Millisecond
+	delay = s.acceptError("Test", ne, orgDelay)
+	if delay != 2*orgDelay {
+		t.Fatalf("Expected delay to double, got %v", delay)
+	}
+	// Now check the max
+	orgDelay = 60 * ACCEPT_MAX_SLEEP / 100
+	delay = s.acceptError("Test", ne, orgDelay)
+	if delay != ACCEPT_MAX_SLEEP {
+		t.Fatalf("Expected delay to double, got %v", delay)
+	}
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	start := time.Now()
+	go func() {
+		s.acceptError("Test", ne, orgDelay)
+		wg.Done()
+	}()
+	time.Sleep(100 * time.Millisecond)
+	// This should kick out the sleep in acceptError
+	s.Shutdown()
+	if dur := time.Since(start); dur >= ACCEPT_MAX_SLEEP {
+		t.Fatalf("Shutdown took too long: %v", dur)
 	}
 }

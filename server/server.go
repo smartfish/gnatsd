@@ -50,6 +50,9 @@ type Info struct {
 	MaxPayload        int      `json:"max_payload"`
 	IP                string   `json:"ip,omitempty"`
 	ClientConnectURLs []string `json:"connect_urls,omitempty"` // Contains URLs a client can connect to.
+	Gateway           string   `json:"gateway,omitempty"`      // Name of the origin Gateway (sent by gateway's INFO)
+	GatewayURLs       []string `json:"gateway_urls,omitempty"` // Gateway URLs in the originating cluster (sent by gateway's INFO)
+	GatewayURL        string   `json:"gateway_url,omitempty"`  // Gateway URL on that server (sent by route's INFO)
 
 	// Used internally for quick look-ups.
 	clientConnectURLs map[string]struct{}
@@ -99,11 +102,22 @@ type Server struct {
 	clientConnectURLs []string
 	lastCURLsUpdate   int64
 
-	// These store the real client/cluster listen ports. They are
+	// For Gateway
+	gatewayListener net.Listener        // Accept listener
+	outGateways     map[string]*client  // outbound gateways
+	inGateways      map[uint64]*client  // inbound gateways
+	cfgGateways     *configGateways     // This holds the content of opts.Gateway.Gateways plus some other state
+	gatewayURLs     map[string]struct{} // Set of all Gateway URLs in the cluster
+	gatewayURL      string              // This server gateway URL (after possible random port is resolved)
+	gatewayInfo     Info                // Gateway Info protocol
+	gatewayInfoJSON []byte              // Marshal'ed Info protocol
+
+	// These store the real client/cluster/gateway listen ports. They are
 	// required during config reload to reset the Options (after
 	// reload) to the actual listen port values.
 	clientActualPort  int
 	clusterActualPort int
+	gatewayActualPort int
 
 	// Used by tests to check that http.Servers do
 	// not set any timeout.
@@ -127,6 +141,13 @@ func New(opts *Options) *Server {
 	// Process TLS options, including whether we require client certificates.
 	tlsReq := opts.TLSConfig != nil
 	verify := (tlsReq && opts.TLSConfig.ClientAuth == tls.RequireAndVerifyClientCert)
+
+	// Validate some options. If there is an error, panic.
+	// It's either that or add a new API that returns an
+	// instance and error.
+	if err := validateOptions(opts); err != nil {
+		panic(err)
+	}
 
 	info := Info{
 		ID:                genID(),
@@ -173,6 +194,17 @@ func New(opts *Options) *Server {
 	s.routes = make(map[uint64]*client)
 	s.remotes = make(map[string]*client)
 
+	// For tracking gateways (outbound and inbound)
+	s.outGateways = make(map[string]*client)
+	s.inGateways = make(map[uint64]*client)
+	s.cfgGateways = new(configGateways)
+	s.gatewayURLs = make(map[string]struct{})
+
+	// We considered having a Gateway if a name is defined.
+	if opts.Gateway.Name != "" {
+		s.setupGatewaysConfig(opts.Gateway.Gateways)
+	}
+
 	// Used to kick out all go routines possibly waiting on server
 	// to shutdown.
 	s.quitCh = make(chan struct{})
@@ -183,6 +215,12 @@ func New(opts *Options) *Server {
 	s.handleSignals()
 
 	return s
+}
+
+func validateOptions(o *Options) error {
+	// Check that gateway is properly configured. Returns no error
+	// if there is no gateway defined.
+	return validateGatewayOptions(o)
 }
 
 func (s *Server) getOpts() *Options {
@@ -296,6 +334,13 @@ func (s *Server) Start() {
 		return
 	}
 
+	// Start up gateway if needed. Do this before starting the routes, because
+	// we want to resolve the gateway host:port so that this information can
+	// be sent to other routes.
+	if opts.Gateway.Port != 0 {
+		s.startGateways()
+	}
+
 	// The Routing routine needs to wait for the client listen
 	// port to be opened and potential ephemeral port selected.
 	clientListenReady := make(chan struct{})
@@ -350,6 +395,13 @@ func (s *Server) Shutdown() {
 		r.setRouteNoReconnectOnClose()
 		conns[i] = r
 	}
+	// Copy off the gateways
+	for _, gw := range s.outGateways {
+		conns[gw.cid] = gw
+	}
+	for i, gw := range s.inGateways {
+		conns[i] = gw
+	}
 
 	// Number of done channel responses we expect.
 	doneExpected := 0
@@ -366,6 +418,13 @@ func (s *Server) Shutdown() {
 		doneExpected++
 		s.routeListener.Close()
 		s.routeListener = nil
+	}
+
+	// Kick Gateway AcceptLoop()
+	if s.gatewayListener != nil {
+		doneExpected++
+		s.gatewayListener.Close()
+		s.gatewayListener = nil
 	}
 
 	// Kick HTTP monitoring if its running
@@ -466,17 +525,7 @@ func (s *Server) AcceptLoop(clr chan struct{}) {
 	for s.isRunning() {
 		conn, err := l.Accept()
 		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Temporary() {
-				s.Errorf("Temporary Client Accept Error (%v), sleeping %dms",
-					ne, tmpDelay/time.Millisecond)
-				time.Sleep(tmpDelay)
-				tmpDelay *= 2
-				if tmpDelay > ACCEPT_MAX_SLEEP {
-					tmpDelay = ACCEPT_MAX_SLEEP
-				}
-			} else if s.isRunning() {
-				s.Errorf("Client Accept Error: %v", err)
-			}
+			tmpDelay = s.acceptError("Client", err, tmpDelay)
 			continue
 		}
 		tmpDelay = ACCEPT_MIN_SLEEP
@@ -918,7 +967,7 @@ func tlsCipher(cs uint16) string {
 	return fmt.Sprintf("Unknown [%x]", cs)
 }
 
-// Remove a client or route from our internal accounting.
+// Remove a client, route or gateway from our internal accounting.
 func (s *Server) removeClient(c *client) {
 	var rID string
 	c.mu.Lock()
@@ -932,6 +981,8 @@ func (s *Server) removeClient(c *client) {
 	if typ == CLIENT && c.opts.Protocol >= ClientProtoInfo {
 		updateProtoInfoCount = true
 	}
+	inboundGateway := c.flags.isSet(inboundGateway)
+	gwName := c.opts.Name
 	c.mu.Unlock()
 
 	s.mu.Lock()
@@ -949,13 +1000,35 @@ func (s *Server) removeClient(c *client) {
 			if ok && c == rc {
 				delete(s.remotes, rID)
 			}
+			s.removeGatewayURL(r.gatewayURL)
 		}
-		// Remove from temporary map in case it is there.
-		s.grMu.Lock()
-		delete(s.grTmpClients, cid)
-		s.grMu.Unlock()
+		s.removeFromTempClients(cid)
+	case GATEWAY:
+		if inboundGateway {
+			delete(s.inGateways, cid)
+		} else {
+			delete(s.outGateways, gwName)
+		}
+		s.removeFromTempClients(cid)
 	}
 	s.mu.Unlock()
+}
+
+func (s *Server) removeFromTempClients(cid uint64) {
+	s.grMu.Lock()
+	delete(s.grTmpClients, cid)
+	s.grMu.Unlock()
+}
+
+func (s *Server) addToTempClients(cid uint64, c *client) bool {
+	added := false
+	s.grMu.Lock()
+	if s.grRunning {
+		s.grTmpClients[cid] = c
+		added = true
+	}
+	s.grMu.Unlock()
+	return added
 }
 
 /////////////////////////////////////////////////////////////////
@@ -1048,7 +1121,7 @@ func (s *Server) ReadyForConnections(dur time.Duration) bool {
 	end := time.Now().Add(dur)
 	for time.Now().Before(end) {
 		s.mu.Lock()
-		ok := s.listener != nil && (opts.Cluster.Port == 0 || s.routeListener != nil)
+		ok := s.listener != nil && (opts.Cluster.Port == 0 || s.routeListener != nil) && (opts.Gateway.Name == "" || s.gatewayListener != nil)
 		s.mu.Unlock()
 		if ok {
 			return true
@@ -1131,4 +1204,27 @@ func (s *Server) getClientConnectURLs() []string {
 	}
 
 	return urls
+}
+
+// If given error is a net.Error and is temporary, sleeps for the given
+// delay and double it, but cap it to ACCEPT_MAX_SLEEP. The sleep is
+// interrupted if the server is shutdown.
+// An error message is displayed depending on the type of error.
+// Returns the new (or unchanged) delay.
+func (s *Server) acceptError(acceptName string, err error, tmpDelay time.Duration) time.Duration {
+	if ne, ok := err.(net.Error); ok && ne.Temporary() {
+		s.Errorf("Temporary %s Accept Error(%v), sleeping %dms", acceptName, ne, tmpDelay/time.Millisecond)
+		select {
+		case <-time.After(tmpDelay):
+		case <-s.quitCh:
+			return tmpDelay
+		}
+		tmpDelay *= 2
+		if tmpDelay > ACCEPT_MAX_SLEEP {
+			tmpDelay = ACCEPT_MAX_SLEEP
+		}
+	} else if s.isRunning() {
+		s.Errorf("%s Accept error: %v", acceptName, err)
+	}
+	return tmpDelay
 }

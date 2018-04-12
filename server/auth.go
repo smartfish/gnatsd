@@ -117,6 +117,8 @@ func (s *Server) checkAuthorization(c *client) bool {
 		return s.isClientAuthorized(c)
 	case ROUTER:
 		return s.isRouterAuthorized(c)
+	case GATEWAY:
+		return s.isGatewayAuthorized(c)
 	default:
 		return false
 	}
@@ -174,6 +176,19 @@ func (s *Server) isRouterAuthorized(c *client) bool {
 		return false
 	}
 	return comparePasswords(opts.Cluster.Password, c.opts.Password)
+}
+
+// isGatewayAuthorized checks optional gateway authorization which can be nil or username/password.
+func (s *Server) isGatewayAuthorized(c *client) bool {
+	// Snapshot server options.
+	opts := s.getOpts()
+	if opts.Gateway.Username == "" {
+		return true
+	}
+	if opts.Gateway.Username != c.opts.Username {
+		return false
+	}
+	return comparePasswords(opts.Gateway.Password, c.opts.Password)
 }
 
 // removeUnauthorizedSubs removes any subscriptions the client has that are no

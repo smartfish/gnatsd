@@ -66,7 +66,7 @@ func TestMultipleUserAuth(t *testing.T) {
 const testToken = "$2a$05$3sSWEVA1eMCbV0hWavDjXOx.ClBjI6u1CuUdLqf22cbJjXsnzz8/."
 
 func TestTokenInConfig(t *testing.T) {
-	confFileName := "test.conf"
+	confFileName := "test_token_in_config.conf"
 	defer os.Remove(confFileName)
 	content := `
 	listen: 127.0.0.1:4567

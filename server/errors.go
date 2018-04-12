@@ -44,4 +44,7 @@ var (
 	// ErrClientConnectedToRoutePort represents an error condition when a client
 	// attempted to connect to the route listen port.
 	ErrClientConnectedToRoutePort = errors.New("Attempted To Connect To Route Port")
+
+	// ErrClientOrRouteConnectedToGatewayPort is ...
+	ErrClientOrRouteConnectedToGatewayPort = errors.New("Attempted To Connect To Gateway Port")
 )

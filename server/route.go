@@ -51,15 +51,18 @@ type route struct {
 	tlsRequired  bool
 	closed       bool
 	connectURLs  []string
+	gatewayURL   string
 }
 
 type connectInfo struct {
-	Verbose  bool   `json:"verbose"`
-	Pedantic bool   `json:"pedantic"`
-	User     string `json:"user,omitempty"`
-	Pass     string `json:"pass,omitempty"`
-	TLS      bool   `json:"tls_required"`
-	Name     string `json:"name"`
+	Verbose    bool   `json:"verbose"`
+	Pedantic   bool   `json:"pedantic"`
+	User       string `json:"user,omitempty"`
+	Pass       string `json:"pass,omitempty"`
+	TLS        bool   `json:"tls_required"`
+	Name       string `json:"name"`
+	GatewayOrg string `json:"gateway_org,omitempty"`
+	GatewayDst string `json:"gateway_dest,omitempty"`
 }
 
 // Route protocol constants
@@ -85,7 +88,7 @@ func (c *client) sendConnect(tlsRequired bool) {
 	}
 	b, err := json.Marshal(cinfo)
 	if err != nil {
-		c.Errorf("Error marshaling CONNECT to route: %v\n", err)
+		c.Errorf("Error marshaling CONNECT to route: %v", err)
 		c.closeConnection()
 		return
 	}
@@ -110,6 +113,13 @@ func (c *client) processRouteInfo(info *Info) {
 	if remoteID != "" && remoteID != info.ID {
 		c.mu.Unlock()
 
+		// This is a protocol sent by a route in the cluster about a possibly
+		// new Gateway that we should try to create an outbound connection to.
+		if info.Gateway != "" {
+			s.processImplicitGateway(info)
+			return
+		}
+
 		// Process this implicit route. We will check that it is not an explicit
 		// route and/or that it has not been connected already.
 		s.processImplicitRoute(info)
@@ -130,6 +140,7 @@ func (c *client) processRouteInfo(info *Info) {
 	// Copy over important information.
 	c.route.authRequired = info.AuthRequired
 	c.route.tlsRequired = info.TLSRequired
+	c.route.gatewayURL = info.GatewayURL
 
 	// If we do not know this route's URL, construct one on the fly
 	// from the information provided.
@@ -401,13 +412,7 @@ func (s *Server) createRoute(conn net.Conn, rURL *url.URL) *client {
 	// to the client (connection) to be closed, leaving this readLoop
 	// uinterrupted, causing the Shutdown() to wait indefinitively.
 	// We need to store the client in a special map, under a special lock.
-	s.grMu.Lock()
-	running := s.grRunning
-	if running {
-		s.grTmpClients[c.cid] = c
-	}
-	s.grMu.Unlock()
-	if !running {
+	if !s.addToTempClients(c.cid, c) {
 		c.mu.Unlock()
 		c.setRouteNoReconnectOnClose()
 		c.closeConnection()
@@ -556,13 +561,16 @@ func (s *Server) addRoute(c *client, info *Info) (bool, bool) {
 		cid := c.cid
 		c.mu.Unlock()
 
-		// Remove from the temporary map
-		s.grMu.Lock()
-		delete(s.grTmpClients, cid)
-		s.grMu.Unlock()
+		// Now that we have registered the route, we can remove from the temp map.
+		s.removeFromTempClients(cid)
 
 		// we don't need to send if the only route is the one we just accepted.
 		sendInfo = len(s.routes) > 1
+
+		// If the INFO contains a Gateway URL, add it to the list for our cluster.
+		if info.GatewayURL != "" {
+			s.addGatewayURL(info.GatewayURL)
+		}
 	}
 	s.mu.Unlock()
 
@@ -678,6 +686,7 @@ func (s *Server) routeAcceptLoop(ch chan struct{}) {
 		TLSRequired:  tlsReq,
 		TLSVerify:    tlsReq,
 		MaxPayload:   s.info.MaxPayload,
+		GatewayURL:   s.gatewayURL,
 	}
 	// Set this if only if advertise is not disabled
 	if !opts.Cluster.NoAdvertise {
@@ -716,17 +725,7 @@ func (s *Server) routeAcceptLoop(ch chan struct{}) {
 	for s.isRunning() {
 		conn, err := l.Accept()
 		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Temporary() {
-				s.Debugf("Temporary Route Accept Errorf(%v), sleeping %dms",
-					ne, tmpDelay/time.Millisecond)
-				time.Sleep(tmpDelay)
-				tmpDelay *= 2
-				if tmpDelay > ACCEPT_MAX_SLEEP {
-					tmpDelay = ACCEPT_MAX_SLEEP
-				}
-			} else if s.isRunning() {
-				s.Noticef("Accept error: %v", err)
-			}
+			tmpDelay = s.acceptError("Route", err, tmpDelay)
 			continue
 		}
 		tmpDelay = ACCEPT_MIN_SLEEP
@@ -843,4 +842,35 @@ func (s *Server) numRoutes() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.routes)
+}
+
+func (c *client) processRouteConnect(arg []byte, lang string) error {
+	// Way to detect clients that incorrectly connect to the route listen
+	// port. Client provide Lang in the CONNECT protocol while ROUTEs don't.
+	if lang != "" {
+		errTxt := ErrClientConnectedToRoutePort.Error()
+		c.Errorf(errTxt)
+		c.sendErr(errTxt)
+		c.closeConnection()
+		return errAlreadyHandled
+	}
+	// Unmarshal as a route connect protocol
+	proto := &connectInfo{}
+	if err := json.Unmarshal(arg, proto); err != nil {
+		return err
+	}
+	// Reject if this has GatewayOrg which means that it would be from a gateway
+	// connection that incorrectly connects to the Route port.
+	if proto.GatewayOrg != "" {
+		errTxt := fmt.Sprintf("Rejecting connection from gateway %q on the Route port", proto.GatewayOrg)
+		c.Errorf(errTxt)
+		c.sendErr(errTxt)
+		c.closeConnection()
+		return errAlreadyHandled
+	}
+	// Grab connection name of remote route.
+	c.mu.Lock()
+	c.route.remoteID = c.opts.Name
+	c.mu.Unlock()
+	return nil
 }

@@ -17,6 +17,7 @@ import (
 	"bufio"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net"
@@ -31,6 +32,8 @@ const (
 	CLIENT = iota
 	// ROUTER is another router in the cluster.
 	ROUTER
+	// GATEWAY is a link between 2 clusters.
+	GATEWAY
 )
 
 const (
@@ -59,6 +62,11 @@ const (
 	maxBufSize   = 65536
 )
 
+// This is used by code that handle an error and do not wish
+// the readLoop to report and send back a parser error back
+// to the client/route/gateway when Parse() returns an error.
+var errAlreadyHandled = errors.New("error already handled")
+
 // Represent client booleans with a bitmask
 type clientFlag byte
 
@@ -67,6 +75,8 @@ const (
 	connectReceived   clientFlag = 1 << iota // The CONNECT proto has been received
 	firstPongSent                            // The first PONG has been sent
 	handshakeComplete                        // For TLS clients, indicate that the handshake is complete
+	outboundGateway                          // This is to flag a GATEWAY connection as outbound
+	inboundGateway                           // This is an inbound GATEWAY connection
 )
 
 // set the flag (would be equivalent to set the boolean to true)
@@ -221,6 +231,8 @@ func (c *client) initClient() {
 		c.ncs = fmt.Sprintf("%s - cid:%d", conn, c.cid)
 	case ROUTER:
 		c.ncs = fmt.Sprintf("%s - rid:%d", conn, c.cid)
+	case GATEWAY:
+		c.ncs = fmt.Sprintf("%s - gid:%d", conn, c.cid)
 	}
 }
 
@@ -294,7 +306,7 @@ func (c *client) readLoop() {
 
 		if err := c.parse(b[:n]); err != nil {
 			// handled inline
-			if err != ErrMaxPayload && err != ErrAuthorization {
+			if err != ErrMaxPayload && err != ErrAuthorization && err != errAlreadyHandled {
 				c.Errorf("Error reading from client: %s", err.Error())
 				c.sendErr("Parser Error")
 				c.closeConnection()
@@ -407,8 +419,11 @@ func (c *client) processInfo(arg []byte) error {
 	if err := json.Unmarshal(arg, &info); err != nil {
 		return err
 	}
-	if c.typ == ROUTER {
+	switch c.typ {
+	case ROUTER:
 		c.processRouteInfo(&info)
+	case GATEWAY:
+		c.processGatewayInfo(arg, &info)
 	}
 	return nil
 }
@@ -419,6 +434,9 @@ func (c *client) processErr(errStr string) {
 		c.Errorf("Client Error %s", errStr)
 	case ROUTER:
 		c.Errorf("Route Error %s", errStr)
+	case GATEWAY:
+		c.Errorf("Gateway Error %s", errStr)
+		c.processGatewayErr(errStr)
 	}
 	c.closeConnection()
 }
@@ -441,7 +459,6 @@ func (c *client) processConnect(arg []byte) error {
 	}
 	c.last = time.Now()
 	typ := c.typ
-	r := c.route
 	srv := c.srv
 	// Moved unmarshalling of clients' Options under the lock.
 	// The client has already been added to the server map, so it is possible
@@ -462,14 +479,17 @@ func (c *client) processConnect(arg []byte) error {
 	c.mu.Unlock()
 
 	if srv != nil {
-		// As soon as c.opts is unmarshalled and if the proto is at
-		// least ClientProtoInfo, we need to increment the following counter.
-		// This is decremented when client is removed from the server's
-		// clients map.
-		if proto >= ClientProtoInfo {
-			srv.mu.Lock()
-			srv.cproto++
-			srv.mu.Unlock()
+		// Applicable to clients only:
+		if typ == CLIENT {
+			// As soon as c.opts is unmarshalled and if the proto is at
+			// least ClientProtoInfo, we need to increment the following counter.
+			// This is decremented when client is removed from the server's
+			// clients map.
+			if proto >= ClientProtoInfo {
+				srv.mu.Lock()
+				srv.cproto++
+				srv.mu.Unlock()
+			}
 		}
 
 		// Check for Auth
@@ -479,28 +499,24 @@ func (c *client) processConnect(arg []byte) error {
 		}
 	}
 
-	// Check client protocol request if it exists.
-	if typ == CLIENT && (proto < ClientProtoZero || proto > ClientProtoInfo) {
-		c.sendErr(ErrBadClientProtocol.Error())
-		c.closeConnection()
-		return ErrBadClientProtocol
-	} else if typ == ROUTER && lang != "" {
-		// Way to detect clients that incorrectly connect to the route listen
-		// port. Client provide Lang in the CONNECT protocol while ROUTEs don't.
-		c.sendErr(ErrClientConnectedToRoutePort.Error())
-		c.closeConnection()
-		return ErrClientConnectedToRoutePort
-	}
-
-	// Grab connection name of remote route.
-	if typ == ROUTER && r != nil {
-		c.mu.Lock()
-		c.route.remoteID = c.opts.Name
-		c.mu.Unlock()
-	}
-
-	if verbose {
-		c.sendOK()
+	switch typ {
+	case CLIENT:
+		// Check client protocol request if it exists.
+		if proto < ClientProtoZero || proto > ClientProtoInfo {
+			c.sendErr(ErrBadClientProtocol.Error())
+			c.closeConnection()
+			return ErrBadClientProtocol
+		}
+		if verbose {
+			c.sendOK()
+		}
+		return nil
+	case ROUTER:
+		// Delegate the rest of processing to the route
+		return c.processRouteConnect(arg, lang)
+	case GATEWAY:
+		// Delegate the rest of processing to the gateway
+		return c.processGatewayConnect(arg)
 	}
 	return nil
 }
@@ -633,9 +649,13 @@ func (c *client) processPing() {
 
 func (c *client) processPong() {
 	c.traceInOp("PONG", nil)
-	c.mu.Lock()
-	c.pout = 0
-	c.mu.Unlock()
+	if c.typ != GATEWAY {
+		c.mu.Lock()
+		c.pout = 0
+		c.mu.Unlock()
+	} else {
+		c.processGatewayPong()
+	}
 }
 
 func (c *client) processMsgArgs(arg []byte) error {
@@ -1346,6 +1366,8 @@ func (c *client) typeString() string {
 		return "Client"
 	case ROUTER:
 		return "Router"
+	case GATEWAY:
+		return "Gateway"
 	}
 	return "Unknown Type"
 }
@@ -1357,7 +1379,13 @@ func (c *client) closeConnection() {
 		return
 	}
 
-	c.Debugf("%s connection closed", c.typeString())
+	// Be consistent with the creation: for routes and gateways,
+	// we use Noticef on create, so use that too for delete.
+	if c.typ == ROUTER || c.typ == GATEWAY {
+		c.Noticef("%s connection closed", c.typeString())
+	} else {
+		c.Debugf("%s connection closed", c.typeString())
+	}
 
 	c.clearAuthTimer()
 	c.clearPingTimer()
@@ -1371,12 +1399,14 @@ func (c *client) closeConnection() {
 		sub.max = 0
 		subs = append(subs, sub)
 	}
-	srv := c.srv
 
 	var (
+		srv           = c.srv
 		routeClosed   bool
 		retryImplicit bool
 		connectURLs   []string
+		ctype         = c.typ
+		gwName        = c.opts.Name
 	)
 	if c.route != nil {
 		routeClosed = c.route.closed
@@ -1447,6 +1477,20 @@ func (c *client) closeConnection() {
 			// Keep track of this go-routine so we can wait for it on
 			// server shutdown.
 			srv.startGoRoutine(func() { srv.reConnectToRoute(rurl, rtype) })
+		}
+	} else if srv != nil && ctype == GATEWAY && c.flags.isSet(outboundGateway) {
+		gw := srv.getGatewayConfig(gwName)
+		if gw != nil {
+			srv.Debugf("Attempting reconnect for gateway %q", gwName)
+			// Run this as a go routine since we may be called within
+			// the solicitGateway itself if there was an error during
+			// the creation of the gateway connection.
+			srv.startGoRoutine(func() {
+				srv.solicitGateway(gw)
+				srv.grWG.Done()
+			})
+		} else {
+			srv.Debugf("Gateway %q not in configuration, not attempting reconnect", gwName)
 		}
 	}
 }
